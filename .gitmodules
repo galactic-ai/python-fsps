@@ -1,3 +1,0 @@
-[submodule "src/fsps/libfsps"]
-	path = src/fsps/libfsps
-	url = https://github.com/cconroy20/fsps
