@@ -88,6 +88,7 @@ SUBROUTINE SPS_SETUP(zin)
   spec_lambda   = 0.
   vega_spec     = 0.
   sun_spec      = 0.
+  IF (.NOT.ALLOCATED(speclib)) ALLOCATE(speclib(nspec,nz,nafe,ndim_logt,ndim_logg))
   speclib       = 0.
   speclib_logg  = 0.
   speclib_logt  = 0.

@@ -514,7 +514,8 @@ MODULE SPS_VARS
   !arrays for stellar spectral information in HR diagram
   REAL(SP), DIMENSION(ndim_logt) :: speclib_logt=0.
   REAL(SP), DIMENSION(ndim_logg) :: speclib_logg=0.
-  REAL(KIND(1.0)), DIMENSION(nspec,nz,nafe,ndim_logt,ndim_logg) :: speclib=0.
+  !allocated in sps_setup; a static array this size does not link on arm64 macOS with AFE_FLAG=1
+  REAL(KIND(1.0)), DIMENSION(:,:,:,:,:), ALLOCATABLE :: speclib
 
   !arrays for the WMBasic grid
   REAL(SP), DIMENSION(ndim_wmb_logt) :: wmb_logt=0.
