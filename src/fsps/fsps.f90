@@ -435,6 +435,45 @@ contains
 
  end subroutine
 
+  subroutine get_ssp_slot(ns,n_age,zi,ai,spec_out,mass_out,lbol_out)
+
+    ! Return the SSP of one metallicity and afe slot, building it first
+    ! if it is not cached. With set_ssp_slot this lets several processes
+    ! build different slots and one process gather them.
+
+    implicit none
+    integer, intent(in) :: ns,n_age,zi,ai
+    double precision, dimension(ns,n_age), intent(out) :: spec_out
+    double precision, dimension(n_age), intent(out) :: mass_out,lbol_out
+
+    if (has_ssp(zi,ai) .eq. 0) then
+       call ssp(zi,ai)
+    endif
+    spec_out = spec_ssp_zz(:,:,zi,ai)
+    mass_out = mass_ssp_zz(:,zi,ai)
+    lbol_out = lbol_ssp_zz(:,zi,ai)
+
+  end subroutine
+
+  subroutine set_ssp_slot(ns,n_age,zi,ai,spec_in,mass_in,lbol_in)
+
+    ! Store the SSP of one metallicity and afe slot, as returned by
+    ! get_ssp_slot in a process with the same setup and SSP parameters,
+    ! and mark it as built, as ssp does after building every age.
+
+    implicit none
+    integer, intent(in) :: ns,n_age,zi,ai
+    double precision, dimension(ns,n_age), intent(in) :: spec_in
+    double precision, dimension(n_age), intent(in) :: mass_in,lbol_in
+
+    spec_ssp_zz(:,:,zi,ai) = spec_in
+    mass_ssp_zz(:,zi,ai) = mass_in
+    lbol_ssp_zz(:,zi,ai) = lbol_in
+    has_ssp(zi,ai) = 1
+    has_ssp_age(zi,ai,:) = 1
+
+  end subroutine
+
   subroutine set_sfh_tab(ntab, age, sfr, met)
 
     ! Fill the sfh_tab array
