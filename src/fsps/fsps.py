@@ -573,11 +573,27 @@ class StellarPopulation(object):
         self._libraries = None
 
     def _update_params(self):
+        # All StellarPopulation objects in a process share one Fortran state.
+        # Sending the SSP parameters clears every cached SSP, so they are not
+        # sent when the cached SSPs were built from exactly these inputs. See
+        # _ssp_cache_key at the end of this module.
+        global _ssp_cache_key
         self.params.check_params()
-        if self.params.dirtiness == 2:
-            driver.set_ssp_params(*[self.params[k] for k in self.params.ssp_params])
         if self.params.dirtiness >= 1:
+            key = _ssp_cache_inputs(self.params)
+            if self.params.dirtiness == 2 and key == _ssp_cache_key:
+                after = _ssp_cache_key
+            elif self.params.dirtiness == 2:
+                after = None if None in key else key
+                _ssp_cache_key = None
+                driver.set_ssp_params(*[self.params[k] for k in self.params.ssp_params])
+            elif _ssp_cache_key is not None and key[1] == _ssp_cache_key[1]:
+                after = _ssp_cache_key
+            else:
+                after = None
+                _ssp_cache_key = None
             driver.set_csp_params(*[self.params[k] for k in self.params.csp_params])
+            _ssp_cache_key = after
         self.params.dirtiness = 0
 
     def _compute_csp(self):
@@ -810,6 +826,164 @@ class StellarPopulation(object):
 
         return spec, mass, lbol
 
+    def build_ssps(self, zmet=None, afeindx=None, processes=None):
+        r"""
+        Build SSPs in parallel helper processes and store them in this
+        process.
+
+        FSPS builds an SSP for one metallicity index ``zmet`` and one
+        alpha-enhancement index ``afeindx`` (a slot) the first time a spectrum
+        needs it, and keeps it until an SSP parameter changes. This method
+        builds the requested slots ahead of time, several at once, so that
+        later calls to ``get_spectrum`` and ``get_mags`` find them built.
+
+        The SSP parameters of this object are first sent to FSPS, so the slots
+        are built with them, even if another ``StellarPopulation`` changed the
+        SSP parameters since this object last computed a spectrum. This may
+        discard SSPs that were already built.
+
+        The slots are split evenly between this process and ``processes - 1``
+        helper processes forked from it. Each helper builds its slots and
+        sends them back, and this process stores them. The copies are exact,
+        so the stored SSPs are equal to the ones this process would build
+        itself. This process builds its own share of the slots in the usual
+        way, which also sets the IMF variables that FSPS keeps for
+        ``isochrones``, as a normal build does. All helpers have exited when
+        this method returns, and it starts no threads. Forking needs the
+        ``fork`` start method of ``multiprocessing``, which Windows does not
+        have. Forking a process that runs other threads can deadlock the
+        helpers, so call this method before starting such threads.
+
+        The CSP parameters are sent to FSPS again on the next spectrum, so the
+        next call to ``get_spectrum`` computes a new spectrum.
+
+        :param zmet: (default: None)
+            The metallicity index, or a sequence of them, to build, each
+            between 1 and ``len(self.zlegend)``. By default, build every
+            metallicity.
+
+        :param afeindx: (default: None)
+            The alpha-enhancement index, or a sequence of them, to build, each
+            between 1 and ``self.n_afe``. By default, build every index. With
+            ``zcontinuous=1``, FSPS uses the two indices around ``afe``, so
+            when ``afe`` is fixed you may pass just those two.
+
+        :param processes: (default: None)
+            The number of processes that build slots, this one included. By
+            default, use the number of CPUs this process may run on. With 1,
+            or with a single slot, every slot is built in this process and
+            nothing is forked.
+        """
+        import multiprocessing
+
+        zmets = self._ssp_slot_indices(zmet, driver.get_nz(), "zmet")
+        afeindxs = self._ssp_slot_indices(afeindx, driver.get_nafe(), "afeindx")
+        slots = [(zi, ai) for zi in zmets for ai in afeindxs]
+
+        if processes is None:
+            if hasattr(os, "process_cpu_count"):
+                processes = os.process_cpu_count() or 1
+            elif hasattr(os, "sched_getaffinity"):
+                processes = len(os.sched_getaffinity(0))
+            else:
+                processes = os.cpu_count() or 1
+        if int(processes) != processes or processes < 1:
+            raise ValueError(f"processes={processes} must be a positive integer")
+        nproc = min(int(processes), len(slots))
+        if nproc > 1 and "fork" not in multiprocessing.get_all_start_methods():
+            raise RuntimeError(
+                "build_ssps needs the 'fork' start method of multiprocessing "
+                "to build SSPs in parallel, and this platform does not have "
+                "it. Use processes=1 to build them in this process."
+            )
+
+        # Send this object's SSP parameters even if it has not changed them,
+        # since another object may have changed the ones FSPS holds.
+        self.params.dirtiness = 2
+        self._update_params()
+        try:
+            # Slot i goes to process i % nproc, where process 0 is this one.
+            self._build_ssp_shares([slots[k::nproc] for k in range(nproc)])
+        finally:
+            # Building an SSP changes the metallicity and afe indices FSPS holds
+            # for the CSP, so send the CSP parameters again before the next
+            # spectrum.
+            self.params.dirtiness = max(1, self.params.dirtiness)
+
+    def _build_ssp_shares(self, shares):
+        r"""
+        Build the SSP slots in ``shares[0]`` in this process and those in each
+        later share in a forked helper process, and store them all in this
+        process. Every helper has exited when this returns.
+        """
+        import multiprocessing
+        from multiprocessing.connection import wait
+
+        NSPEC = driver.get_nspec()
+        NTFULL = driver.get_ntfull()
+        helpers = []
+        try:
+            if len(shares) > 1:
+                ctx = multiprocessing.get_context("fork")
+            for share in shares[1:]:
+                reader, writer = ctx.Pipe(duplex=False)
+                helper = ctx.Process(
+                    target=_send_ssp_slots,
+                    args=(writer, NSPEC, NTFULL, share),
+                    daemon=True,
+                )
+                helper.start()
+                # Close our copy of the write end before the next fork, so the
+                # reader sees the end of the pipe when this helper exits.
+                writer.close()
+                helpers.append((helper, reader, len(share)))
+
+            for zi, ai in shares[0]:
+                driver.get_ssp_slot(NSPEC, NTFULL, zi, ai)
+
+            remaining = {reader: count for _, reader, count in helpers}
+            while remaining:
+                for reader in wait(list(remaining)):
+                    try:
+                        zi, ai, spec, mass, lbol = reader.recv()
+                    except EOFError:
+                        raise RuntimeError(
+                            "A helper process exited before it sent all its SSPs"
+                        ) from None
+                    driver.set_ssp_slot(zi, ai, spec, mass, lbol)
+                    remaining[reader] -= 1
+                    if remaining[reader] == 0:
+                        del remaining[reader]
+
+            for helper, _, _ in helpers:
+                helper.join()
+                if helper.exitcode != 0:
+                    raise RuntimeError(
+                        f"A helper process exited with code {helper.exitcode}"
+                    )
+        finally:
+            for helper, reader, _ in helpers:
+                if helper.is_alive():
+                    helper.terminate()
+                helper.join()
+                reader.close()
+
+    @staticmethod
+    def _ssp_slot_indices(value, n, name):
+        r"""
+        Return the sorted, distinct SSP slot indices in ``value``, or every
+        index from 1 to ``n`` if ``value`` is None.
+        """
+        if value is None:
+            return list(range(1, n + 1))
+        indices = sorted(set(np.atleast_1d(value).tolist()))
+        if len(indices) == 0:
+            raise ValueError(f"{name} is empty")
+        for i in indices:
+            if isinstance(i, bool) or int(i) != i or not 1 <= i <= n:
+                raise ValueError(f"{name}={i} is not an integer in [1, {n}]")
+        return [int(i) for i in indices]
+
     @property
     def _csp_young_old(self):
         """Get the (unattenuated) young and old component spectra of the CSP
@@ -1032,6 +1206,9 @@ class StellarPopulation(object):
         if wmax is None:
             wmax = wave.max()
         sig = np.interp(self.wavelengths, wave, sigma)
+        # SSPs built with smooth_lsf use the LSF, so the cache key no longer holds.
+        global _ssp_cache_key
+        _ssp_cache_key = None
         driver.set_ssp_lsf(sig, wmin, wmax)
         if self.params["smooth_lsf"]:
             self.params.dirtiness = max(2, self.params.dirtiness)
@@ -1435,3 +1612,76 @@ class ParameterSet(object):
                 self.dirtiness = max(1, self.dirtiness)
 
             self._params[k] = v
+
+
+def _send_ssp_slots(conn, nspec, ntfull, slots):
+    r"""
+    Build each SSP slot ``(zmet, afeindx)`` in ``slots`` and send it through
+    ``conn``. ``StellarPopulation.build_ssps`` runs this in its forked helper
+    processes.
+    """
+    for zi, ai in slots:
+        spec, mass, lbol = driver.get_ssp_slot(nspec, ntfull, zi, ai)
+        conn.send((zi, ai, spec, mass, lbol))
+    conn.close()
+
+
+# The inputs that the SSPs cached in the Fortran driver were built from, or
+# None when they are not known. The driver keeps one SSP cache per process
+# (has_ssp and spec_ssp_zz in fsps.f90). driver.set_ssp_params clears it, and
+# ssp_gen fills it one slot at a time from the Fortran state at the time of
+# each build. Besides the SSP parameters, ssp_gen reads smooth_velocity
+# (smoothspec uses it for the AGB dust shells and for the LSF), the LSF from
+# set_lsf when smooth_lsf is on, the nebular parameters when add_neb_emission
+# is 2, and an IMF file when imf_type is 5.
+#
+# The key is a pair. The first item holds the SSP parameters and the second
+# holds smooth_velocity, each value with its exact type and bits. No key is
+# recorded unless imf_type is an integer other than 5 and add_neb_emission is
+# a bool or integer equal to 0 or 1, since otherwise ssp_gen reads inputs that
+# the key does not hold. _update_params records the key after it has sent
+# both parameter sets. Every call that changes the inputs of ssp_gen clears
+# the key first. These calls are set_ssp_params, set_csp_params with a
+# different smooth_velocity or with add_neb_emission not 0 or 1, and
+# set_ssp_lsf in set_lsf. So while the key is not None, every cached SSP was
+# built from exactly the inputs in the key, and a population whose inputs
+# equal the key would rebuild the same SSPs. _update_params then keeps the
+# cache. A forked child inherits the key together with the Fortran state it
+# describes. Code that calls these driver functions directly must set the key
+# to None.
+_ssp_cache_key = None
+
+
+def _exact_value(v):
+    """Return v with its exact type and bits, or None if v has another type."""
+    t = type(v)
+    if t is bool or t is int:
+        return (t, v)
+    if t is float:
+        return (t, np.float64(v).tobytes())
+    if isinstance(v, (np.bool_, np.integer, np.floating)):
+        return (t, v.tobytes())
+    if t is np.ndarray and v.dtype.kind in "biuf":
+        return (t, v.dtype.str, v.shape, v.tobytes())
+    return None
+
+
+def _is_flag(v):
+    """Return True if v is a bool or an integer equal to 0 or 1."""
+    return isinstance(v, (bool, int, np.bool_, np.integer)) and v in (0, 1)
+
+
+def _ssp_cache_inputs(params):
+    """Return the cache key of the SSPs that params would build.
+
+    An item is None when its values cannot be compared exactly, or when
+    ssp_gen would also read inputs that the key does not hold.
+    """
+    ssp = tuple(_exact_value(params[k]) for k in params.ssp_params)
+    imf_type = params["imf_type"]
+    if None in ssp or not isinstance(imf_type, (int, np.integer)) or imf_type == 5:
+        ssp = None
+    csp = _exact_value(params["smooth_velocity"])
+    if not _is_flag(params["add_neb_emission"]):
+        csp = None
+    return ssp, csp
